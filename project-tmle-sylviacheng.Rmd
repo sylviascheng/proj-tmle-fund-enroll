@@ -1,0 +1,397 @@
+---
+title: "Research Project: TMLE Implementation"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+author: "Sylvia Cheng"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+# set up 
+
+```{r library, echo = TRUE, error = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(include = TRUE, echo = TRUE, 
+                      error = FALSE, warning = FALSE, message = FALSE)
+
+library(data.table)
+library(janitor)
+library(tidyverse)
+library(flextable)
+library(sl3)
+library(tmle)
+library(tmle3)
+library(SuperLearner)
+library(origami)
+library(ranger)
+```
+
+# prepare data
+
+```{r, data-read-in}
+data <- read_csv("data_tmle_analysis.csv") %>% 
+  mutate(hv_1216 = hv_1216/1000, # make the unit of all $ variables per 1000
+         hv_1519 = hv_1519/1000,
+         income_1216 = income_1216/1000,
+         totrev_1617 = totrev_1617/1000,
+         totrev_1415 = totrev_1415/1000,
+         totrev_higher_than_med = case_when(totrev_1617 - totrev_1617 %>% median() >= 0 ~ 1, TRUE ~ 0), # treatment
+         hv_higher_than_med = case_when(hv_1216 - hv_1216 %>% median() >= 0 ~ 1, TRUE ~ 0), # stratification 1
+         percblack_higher_than_med = case_when(perc_black_1314 - perc_black_1314 %>% median() >= 0 ~ 1, TRUE ~ 0)
+         ) %>% # stratification 2
+  filter(!District == "Los Angeles Unified") 
+
+data.table(data) -> data_tabled
+
+colnames(data_tabled) # show all the variables we have
+```
+
+
+# make SL libraries
+
+```{r}
+lrnr_glm <- Lrnr_glm$new()
+lrnr_gam <- Lrnr_gam$new()
+lrnr_lasso <- Lrnr_glmnet$new(alpha = 1) 
+lrnr_enet <- Lrnr_glmnet$new(alpha = 0.5) 
+lrnr_ridge <- Lrnr_glmnet$new(alpha = 0) 
+lrnr_polspline <- Lrnr_polspline$new() # can pick up interactions
+lrnr_earth <- Lrnr_earth$new()
+lrnr_nnls <- Lrnr_nnls$new()
+lrnr_ranger <- Lrnr_ranger$new() # also picks up inter through the procedure, fast!
+lrnr_xgboost100 <- Lrnr_xgboost$new(nrounds = 100, early_stopping_rounds = 10) # SAME HERE, any treee based learners 
+
+discrete <- Lrnr_cv_selector$new(loss_squared_error) # our meta-learner
+
+sl_g <- Lrnr_sl$new(
+  list(lrnr_glm, lrnr_earth, lrnr_ridge, lrnr_ranger),
+  discrete
+)
+
+# build interaction lrnr
+vars_forlist_black <- c("dist_size_1314", "totrev_1415", "gp_perc_1216", "pov_1216", "hv_1216")
+MyList_black <- list()
+for (var in 1:length(vars_forlist_black)){
+  MyList_black[[var]] <- c("totrev_higher_than_med", vars_forlist_black[var])
+} 
+lrnr_interact_black <- Lrnr_define_interactions$new(interactions = MyList_black)
+lrnr_glm_interact_full_black <- make_learner(Pipeline, lrnr_interact_black, lrnr_glm)
+
+vars_forlist_hv <- c("dist_size_1314", "perc_black_1314", "totrev_1415", "gp_perc_1216", "pov_1216")
+MyList_hv <- list()
+for (var in 1:length(vars_forlist_hv)){
+  MyList_hv[[var]] <- c("totrev_higher_than_med", vars_forlist_hv[var])
+} 
+lrnr_interact_hv <- Lrnr_define_interactions$new(interactions = MyList_hv)
+lrnr_glm_interact_full_hv <- make_learner(Pipeline, lrnr_interact_hv, lrnr_glm)
+
+
+# learners for each interaction term 
+term_dist1314 <- list(c("totrev_higher_than_med", "dist_size_1314"))
+term_percblack1314 <- list(c("totrev_higher_than_med", "perc_black_1314"))
+term_totrev1415 <- list(c("totrev_higher_than_med", "totrev_1415"))
+term_gpperc1216 <- list(c("totrev_higher_than_med", "gp_perc_1216"))
+term_pov1216 <- list(c("totrev_higher_than_med", "pov_1216"))
+term_hv1216 <- list(c("totrev_higher_than_med", "hv_1216"))
+
+lrnr_interact_term_dist1314 <- Lrnr_define_interactions$new(interactions = term_dist1314)
+lrnr_glm_interact_term_dist1314 <- make_learner(Pipeline, lrnr_interact_term_dist1314, lrnr_glm)
+
+lrnr_interact_term_percblack1314 <- Lrnr_define_interactions$new(interactions = term_percblack1314)
+lrnr_glm_interact_term_percblack1314 <- make_learner(Pipeline, lrnr_interact_term_percblack1314, lrnr_glm)
+
+lrnr_interact_term_totrev1415 <- Lrnr_define_interactions$new(interactions = term_totrev1415)
+lrnr_glm_interact_term_totrev1415 <- make_learner(Pipeline, lrnr_interact_term_totrev1415, lrnr_glm)
+
+lrnr_interact_term_gpperc1216 <- Lrnr_define_interactions$new(interactions = term_gpperc1216)
+lrnr_glm_interact_term_gpperc1216 <- make_learner(Pipeline, lrnr_interact_term_gpperc1216, lrnr_glm)
+
+lrnr_interact_term_pov1216 <- Lrnr_define_interactions$new(interactions = term_pov1216)
+lrnr_glm_interact_term_pov1216 <- make_learner(Pipeline, lrnr_interact_term_pov1216, lrnr_glm)
+
+lrnr_interact_term_hv1216 <- Lrnr_define_interactions$new(interactions = term_hv1216)
+lrnr_glm_interact_term_hv1216 <- make_learner(Pipeline, lrnr_interact_term_hv1216, lrnr_glm)
+
+# different SL of Q for different stratifications ----
+sl_Q_black <- Lrnr_sl$new(
+  list(lrnr_glm, lrnr_earth, lrnr_lasso, lrnr_enet, lrnr_ridge, lrnr_ranger, 
+       lrnr_glm_interact_full_black, lrnr_glm_interact_term_hv1216,
+       lrnr_glm_interact_term_dist1314, lrnr_glm_interact_term_totrev1415, 
+       lrnr_glm_interact_term_gpperc1216, lrnr_glm_interact_term_pov1216
+  ), 
+  discrete
+)
+
+sl_Q_hv <- Lrnr_sl$new(
+  list(lrnr_glm, lrnr_earth, lrnr_lasso, lrnr_enet, lrnr_ridge, lrnr_ranger, 
+       lrnr_glm_interact_full_hv, lrnr_glm_interact_term_dist1314, 
+       lrnr_glm_interact_term_percblack1314, lrnr_glm_interact_term_totrev1415, 
+       lrnr_glm_interact_term_gpperc1216, lrnr_glm_interact_term_pov1216
+  ), 
+  discrete
+)
+
+learner_list_black <- list(Y = sl_Q_black, A = sl_g)
+learner_list_hv <- list(Y = sl_Q_hv, A = sl_g)
+
+W_black <-c("dist_size_1314", "totrev_1415", "gp_perc_1216", "pov_1216", "income_1216", "hv_1216")
+W_hv <-c("dist_size_1314", "perc_black_1314", "totrev_1415", "gp_perc_1216", "pov_1216", "income_1216")
+
+node_list_black <- list(W = W_black, V = "percblack_higher_than_med", A = "totrev_higher_than_med", Y = "perc_black_1718")
+node_list_hv <- list(W = W_hv, V = "hv_higher_than_med", A = "totrev_higher_than_med", Y = "perc_black_1718")
+
+ate_spec <- tmle_ATE(treatment_level = 1, control_level = 0) 
+spec <- tmle_stratified(ate_spec)
+```
+
+
+# stratified TMLE: housing value
+
+```{r}
+set.seed(5824)
+stratified_fit_hv <- tmle3(spec, data_tabled, node_list_hv, learner_list_hv)
+stratified_fit_hv
+```
+
+# stratified TMLE: black student enrollment
+
+```{r}
+set.seed(5824)
+stratified_fit_black <- tmle3(spec, data_tabled, node_list_black, learner_list_black)
+stratified_fit_black
+
+```
+
+```{r}
+# result_param <- c(param = stratified_fit_black$summary$param)
+# result_ATE <- c(ATE = stratified_fit_black$summary$tmle_est)
+# result_SE <- c(SE = stratified_fit_black$summary$se)
+# result_CI_lower <- c(CI_lower = stratified_fit_black$summary$lower)
+# result_CI_upper <- c(CI_upper = stratified_fit_black$summary$upper) 
+# 
+# result_param %>% as_tibble() %>% rename(param = value) -> result_param
+# result_ATE %>% as_tibble() %>% rename(ATE = value) -> result_ATE
+# result_SE %>% as_tibble() %>% rename(SE = value) -> result_SE
+# result_CI_lower %>% as_tibble() %>% rename(CI_lower = value) -> result_CI_lower
+# result_CI_upper %>% as_tibble() %>% rename(CI_upper = value) -> result_CI_upper
+# 
+# 
+# result_param %>% bind_cols(result_ATE) %>% bind_cols(result_SE) %>% bind_cols(result_CI_lower) %>%
+#   bind_cols(result_CI_upper) %>%
+#   mutate(ATE = (exp(ATE)-1)*100,
+#          SE = (exp(SE)-1)*100, 
+#          CI_lower = (exp(CI_lower)-1)*100,
+#          CI_upper = (exp(CI_upper)-1)*100
+#          ) %>% 
+#   flextable() %>% autofit() %>% add_header_lines("table. exponentiated results of stratification on black student enrollment")
+
+```
+
+
+# TMLE: no stratification
+
+```{r}
+vars_forlist_nostrat <- c("dist_size_1314", "totrev_1415", "gp_perc_1216", "pov_1216", "hv_1216", "perc_black_1314")
+MyList_nostrat <- list()
+for (var in 1:length(vars_forlist_nostrat)){
+  MyList_nostrat[[var]] <- c("totrev_higher_than_med", vars_forlist_nostrat[var])
+} 
+lrnr_interact_nostrat <- Lrnr_define_interactions$new(interactions = MyList_nostrat)
+lrnr_glm_interact_full_nostrat <- make_learner(Pipeline, lrnr_interact_nostrat, lrnr_glm)
+
+sl_Q_nostrat <- Lrnr_sl$new(
+  list(lrnr_glm, lrnr_earth, lrnr_lasso, lrnr_enet, lrnr_ridge, lrnr_ranger, 
+       lrnr_glm_interact_full_nostrat, lrnr_glm_interact_term_hv1216,
+       lrnr_glm_interact_term_dist1314, lrnr_glm_interact_term_totrev1415, 
+       lrnr_glm_interact_term_gpperc1216, lrnr_glm_interact_term_pov1216, lrnr_glm_interact_term_percblack1314
+  ), 
+  discrete
+)
+
+learner_list_nostrat <- list(Y = sl_Q_nostrat, A = sl_g)
+
+W_nostrat <-c("dist_size_1314", "perc_black_1314", "totrev_1415", "gp_perc_1216", "hv_1216", "pov_1216", "income_1216")
+
+node_list_nostrat <- list(W = W_nostrat, A = "totrev_higher_than_med", Y = "perc_black_1718")
+
+set.seed(5824)
+nostrat_fit <- tmle3(ate_spec, data_tabled, node_list_nostrat, learner_list_nostrat)
+nostrat_fit
+```
+
+
+# CV risks, propensity scores, and variable importance
+
+## functions 
+
+```{r}
+# function to get SL's CV risk table for predicting **A** from tmle3 fit
+get_cvrisk_tbl_A <- function(tmle3_fit){
+  cvrisk_tbl_A <- tmle3_fit$likelihood$initial_likelihood$factor_list$A$learner$cv_risk(loss_squared_error)[,c(1,3)]
+  cvrisk_tbl_A$coefficients <- c(tmle3_fit$likelihood$initial_likelihood$factor_list$A$learner$coefficients, NA)
+  return(cvrisk_tbl_A)
+}
+
+# function to get SL's CV risk table for predicting **Y** from tmle3 fit
+get_cvrisk_tbl_Y <- function(tmle3_fit){
+  cvrisk_tbl_Y <- tmle3_fit$likelihood$initial_likelihood$factor_list$Y$learner$cv_risk(loss_squared_error)[,c(1,3)]
+  cvrisk_tbl_Y$coefficients <- c(tmle3_fit$likelihood$initial_likelihood$factor_list$Y$learner$coefficients, NA)
+  return(cvrisk_tbl_Y)
+}
+
+# function to get plot of propensity scores (PS) to examine positivity
+get_PSplot <- function(tmle3_fit){
+  propensity_score <- tmle3_fit$likelihood$initial_likelihood$factor_list$A$learner$predict()
+  A_factor <- ifelse(data_tabled$totrev_higher_than_med == 1, "Group with A=1", 
+                     "Group with A=0")
+  plot_df <- data.frame(Group = as.factor(A_factor), PS = propensity_score)
+  PSplot <- ggplot(plot_df, aes(x = PS, color = Group)) + 
+    geom_histogram(fill = "white",  position = "dodge", binwidth = .01) +
+    geom_density(alpha = .2) +
+    xlim(c(0,1)) +
+    theme(legend.title = element_blank()) +
+    scale_color_brewer(palette="Accent") + 
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(title="Distribution of Propensity Scores", x="Propensity Score", y="Counts")
+  return(PSplot)
+}
+
+```
+
+## stratified: black student enrollment
+
+### A
+
+```{r}
+get_cvrisk_tbl_A(stratified_fit_black)
+```
+
+### Y
+
+```{r}
+get_cvrisk_tbl_Y(stratified_fit_black)
+```
+
+### propensity score plot 
+
+```{r}
+get_PSplot(stratified_fit_black)
+```
+
+### by the median of black student enrollment
+
+```{r}
+get_PSplot_black <- function(tmle3_fit){
+  propensity_score <- tmle3_fit$likelihood$initial_likelihood$factor_list$A$learner$predict()
+  A_factor <- ifelse(data_tabled$totrev_higher_than_med == 1, "Group with A=1", 
+                     "Group with A=0")
+  black_yn <- ifelse(data_tabled$percblack_higher_than_med == 1, "black student enrollment >= median", 
+                     "black student enrollment < median")
+  plot_df_black <- data.frame(Group = as.factor(A_factor), PS = propensity_score, stratifier = as.factor(black_yn))
+  PSplot_black <- ggplot(plot_df_black, aes(x = PS, color = Group)) + 
+    geom_histogram(fill = "white",  position = "dodge", binwidth = .01) +
+    facet_wrap(vars(stratifier)) +
+    geom_density(alpha = .2) +
+    xlim(c(0,1)) +
+    theme(legend.title = element_blank()) +
+    scale_color_brewer(palette="Accent") + 
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(title="Distribution of Propensity Scores", x="Propensity Score", y="Counts")
+  return(PSplot_black)
+}
+
+get_PSplot_black(stratified_fit_black)
+```
+
+## stratified: housing value 
+
+### A
+
+```{r}
+get_cvrisk_tbl_A(stratified_fit_hv)
+```
+
+### Y
+
+```{r}
+get_cvrisk_tbl_Y(stratified_fit_hv)
+```
+
+### propensity score plot 
+
+```{r}
+get_PSplot(stratified_fit_hv)
+```
+
+### by the median of housing value
+
+```{r}
+get_PSplot_hv <- function(tmle3_fit){
+  propensity_score <- tmle3_fit$likelihood$initial_likelihood$factor_list$A$learner$predict()
+  A_factor <- ifelse(data_tabled$totrev_higher_than_med == 1, "Group with A=1", 
+                     "Group with A=0")
+  hv_yn <- ifelse(data_tabled$hv_higher_than_med == 1, "housing value >= median", 
+                     "housing value < median")
+  plot_df_hv <- data.frame(Group = as.factor(A_factor), PS = propensity_score, stratifier = as.factor(hv_yn))
+  PSplot_hv <- ggplot(plot_df_hv, aes(x = PS, color = Group)) + 
+    geom_histogram(fill = "white",  position = "dodge", binwidth = .01) +
+    facet_wrap(vars(stratifier)) +
+    geom_density(alpha = .2) +
+    xlim(c(0,1)) +
+    theme(legend.title = element_blank()) +
+    scale_color_brewer(palette="Accent") + 
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(title="Distribution of Propensity Scores", x="Propensity Score", y="Counts")
+  return(PSplot_hv)
+}
+
+get_PSplot_hv(stratified_fit_hv)
+```
+
+
+## no-stratification 
+
+### A
+
+```{r}
+get_cvrisk_tbl_A(nostrat_fit)
+```
+
+### Y
+
+```{r}
+get_cvrisk_tbl_Y(nostrat_fit)
+```
+
+### propensity score plot 
+
+```{r}
+get_PSplot(nostrat_fit)
+```
+
+
+# non-TMLE stat for comparison
+
+## t-test by the median of housing value at baseline
+
+```{r}
+t.test(totrev_higher_than_med ~ hv_higher_than_med, data = data_tabled, var.equal = FALSE) -> test
+
+test$stderr
+```
+
+## t-test by the median of black student enrollment at baseline 
+
+```{r}
+t.test(totrev_higher_than_med ~ percblack_higher_than_med, data = data_tabled, var.equal = FALSE)
+```
+
+## glm model 
+
+```{r}
+lm.model <- glm(totrev_higher_than_med ~ dist_size_1314 + perc_black_1314 + totrev_1415 + gp_perc_1216 + pov_1216, data = data_tabled, family = binomial() )
+
+summary(lm.model)
+
+```
